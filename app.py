@@ -1,31 +1,33 @@
 # app.py
+"""
+AI Resume <-> Job Description Optimizer — Production-ready single-file Streamlit app.
+- Robust Hugging Face integration: prefers InferenceClient; falls back to InferenceApi with explicit task="text2text-generation".
+- Retries, exponential backoff, response normalization.
+- sentence-transformers semantic scoring (all-MiniLM-L6-v2).
+- Safe fallbacks: if HF is not configured or fails, app returns templated rewrites so the user can continue.
+IMPORTANT: Do NOT hardcode your HF token here. Set via Streamlit Secrets (TOML):
+  HF_TOKEN = "hf_xxxYOURTOKENxxx"
+  HF_MODEL = "google/flan-t5-small"
+"""
+
 import os
 import io
 import re
 import time
-import json
-from typing import List
+import traceback
+from typing import List, Optional
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
 
-from dotenv import load_dotenv
-load_dotenv()  # loads .env in local dev if present
+# --------- Secrets / config (Streamlit secrets preferred) ----------
+HF_TOKEN = st.secrets.get("HF_TOKEN") if "HF_TOKEN" in st.secrets else os.getenv("HF_TOKEN")
+HF_MODEL = st.secrets.get("HF_MODEL") if "HF_MODEL" in st.secrets else os.getenv("HF_MODEL", "google/flan-t5-small")
 
-# -----------------------------
-# Config / Tokens
-# -----------------------------
-# Read token from environment (local) or Streamlit secrets
-HF_TOKEN = os.getenv("HF_TOKEN") or (st.secrets.get("HF_TOKEN") if "HF_TOKEN" in st.secrets else None)
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-large")
-USE_HF = bool(HF_TOKEN)
-
-# -----------------------------
-# Optional: local model for embeddings
-# -----------------------------
+# --------- Embedding model (sentence-transformers) ----------
 from sentence_transformers import SentenceTransformer, util
+
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
 @st.cache_resource(show_spinner=False)
@@ -34,20 +36,7 @@ def load_embedding_model():
 
 embed_model = load_embedding_model()
 
-# -----------------------------
-# Hugging Face Inference Client (lazy)
-# -----------------------------
-_hf_client = None
-def get_hf_client(model_id=HF_MODEL):
-    global _hf_client
-    if _hf_client is None:
-        from huggingface_hub import InferenceApi
-        _hf_client = InferenceApi(repo_id=model_id, token=HF_TOKEN)
-    return _hf_client
-
-# -----------------------------
-# Simple NLP helpers (no heavy spaCy dependency)
-# -----------------------------
+# --------- Simple NLP utilities ----------
 STOPWORDS = {
     "the","and","to","of","a","in","for","with","on","by","as","an","is","are",
     "was","were","be","that","this","it","at","from","or","into","per","via",
@@ -78,41 +67,21 @@ REQUIRED_HINTS = {"must", "required", "need", "essential", "mandatory"}
 def clean_text(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "")).strip()
 
-def extract_text_from_upload(file) -> str:
-    name = file.name.lower()
-    data = file.read()
-    if name.endswith(".txt"):
-        return data.decode("utf-8", errors="ignore")
-    if name.endswith(".docx"):
-        from docx import Document
-        bio = io.BytesIO(data)
-        doc = Document(bio)
-        return "\n".join(p.text for p in doc.paragraphs)
-    if name.endswith(".pdf"):
-        from pdfminer.high_level import extract_text
-        bio = io.BytesIO(data)
-        return extract_text(bio)
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
 def tokenize_candidates(text: str):
     text = (text or "").lower()
     toks = re.findall(r"[a-zA-Z0-9\+\#\.]{2,}", text)
     toks = [t for t in toks if t not in STOPWORDS and len(t) > 1]
-    # also include multi-word phrases (naive)
     phrases = re.findall(r"(?:[a-zA-Z]+\s){1,4}[a-zA-Z]+", text)
     candidates = set(toks + phrases)
     return sorted(candidates)
 
 def map_to_skills(candidates: List[str]) -> List[str]:
     normalized = set()
-    cand_set = set(candidates)
+    cand_join = " ".join(candidates)
     for skill, variants in SKILL_SYNONYMS.items():
-        if any(v in " ".join(cand_set) for v in variants):
+        if any(v in cand_join for v in variants):
             normalized.add(skill)
-    for c in cand_set:
+    for c in candidates:
         if c in {"python","sql","aws","azure","gcp","docker","kubernetes","fastapi","react","streamlit","pytorch","tensorflow","keras","langchain","faiss","airflow"}:
             normalized.add(c)
     return sorted(normalized)
@@ -126,28 +95,20 @@ def detect_required_keywords(jd_text: str) -> set:
                 req.add(skill)
     return req
 
-# -----------------------------
-# Semantic coverage score (sentence-transformers)
-# -----------------------------
+# --------- Semantic score ----------
 def semantic_cover_score(jd_text: str, cv_text: str):
-    # chunk inputs if too long
     jd_chunks = [jd_text[i:i+300] for i in range(0, len(jd_text), 300)] if jd_text else []
     cv_chunks = [cv_text[i:i+600] for i in range(0, len(cv_text), 600)] if cv_text else []
-
     if not jd_chunks or not cv_chunks:
         return 0.0
-
     jd_emb = embed_model.encode(jd_chunks, convert_to_tensor=True)
     cv_emb = embed_model.encode(cv_chunks, convert_to_tensor=True)
-
-    sims = util.cos_sim(jd_emb, cv_emb)  # shape (len(jd), len(cv))
+    sims = util.cos_sim(jd_emb, cv_emb)
     best_per_jd = sims.max(dim=1).values.cpu().numpy()
-    avg_sim = float(best_per_jd.mean())  # 0..1
+    avg_sim = float(best_per_jd.mean())
     return round(avg_sim * 100, 1)
 
-# -----------------------------
-# Bullet extraction
-# -----------------------------
+# --------- Bullet extraction ----------
 def extract_bullets(cv_text: str) -> List[str]:
     lines = [l.strip() for l in cv_text.splitlines() if l.strip()]
     bullets = []
@@ -159,54 +120,7 @@ def extract_bullets(cv_text: str) -> List[str]:
         bullets = parts[:8]
     return bullets[:8]
 
-# -----------------------------
-# HF-based rewrite (with fallback)
-# -----------------------------
-def rewrite_bullets_with_hf(bullets: List[str], jd_text: str, model_id=HF_MODEL):
-    if not bullets:
-        return []
-    if not USE_HF:
-        # simple fallback
-        jd_cand = map_to_skills(tokenize_candidates(jd_text))
-        out = []
-        for i, b in enumerate(bullets[:5]):
-            extra = (jd_cand[i % len(jd_cand)] if jd_cand else "role requirements")
-            out.append(f"{b} (Aligned to {extra}; quantify impact where possible.)")
-        return out
-
-    client = get_hf_client(model_id=model_id)
-    prompt_template = (
-        "You are an expert resume editor. Rewrite the following resume bullet to be concise (<=24 words), "
-        "start with a strong active verb, naturally include relevant skill keywords from the job description, and emphasise measurable impact where possible.\n\n"
-        "JOB DESCRIPTION:\n"
-        "{jd}\n\nBULLET:\n{bullet}\n\nReturn the rewritten bullet only."
-    )
-
-    rewritten = []
-    for b in bullets[:5]:
-        prompt = prompt_template.format(jd=jd_text, bullet=b)
-        try:
-            resp = client(inputs=prompt, parameters={"max_new_tokens": 80, "temperature": 0.2})
-            # resp may be a dict with 'generated_text' or a string
-            if isinstance(resp, dict) and "generated_text" in resp:
-                text = resp["generated_text"]
-            elif isinstance(resp, list) and len(resp) and isinstance(resp[0], dict) and "generated_text" in resp[0]:
-                text = resp[0]["generated_text"]
-            elif isinstance(resp, str):
-                text = resp
-            else:
-                text = str(resp)
-            text = text.strip().replace("\n", " ")
-            rewritten.append(text)
-            time.sleep(0.15)
-        except Exception as e:
-            st.warning(f"Hugging Face call error (falling back): {e}")
-            rewritten.append(f"{b} (tailored to JD; improve with HF token).")
-    return rewritten
-
-# -----------------------------
-# Analysis core: map skills + compute coverage/score
-# -----------------------------
+# --------- Analysis core ----------
 class AnalysisResult:
     def __init__(self, jd_skills, cv_skills, missing_core, nice_to_have, score, coverage, weighted):
         self.jd_skills = jd_skills
@@ -220,35 +134,24 @@ class AnalysisResult:
 def analyze_match(cv_text: str, jd_text: str) -> AnalysisResult:
     cv_text = clean_text(cv_text)
     jd_text = clean_text(jd_text)
-
     jd_cand = tokenize_candidates(jd_text)
     cv_cand = tokenize_candidates(cv_text)
-
     jd_skills = map_to_skills(jd_cand)
     cv_skills = map_to_skills(cv_cand)
-
     required = detect_required_keywords(jd_text)
     jd_set = set(jd_skills)
     cv_set = set(cv_skills)
-
     missing = list(jd_set - cv_set)
     present = list(jd_set & cv_set)
-
     req_present = list(required & cv_set)
     req_missing = list(required - cv_set)
-
     coverage = (len(present) / len(jd_set)) if len(jd_set) else 0.0
-
-    # weight required skills more
     weighted_total = len(jd_set) + len(required)
     weighted_hit = len(present) + len(req_present)
     weighted = weighted_hit / max(1, weighted_total)
-
     score = round(100 * (0.4 * coverage + 0.6 * weighted), 1)
-
     missing_core = sorted(list(req_missing))
     nice_to_have = sorted([m for m in missing if m not in missing_core])
-
     return AnalysisResult(
         jd_skills=jd_skills,
         cv_skills=cv_skills,
@@ -259,23 +162,150 @@ def analyze_match(cv_text: str, jd_text: str) -> AnalysisResult:
         weighted=round(weighted * 100, 1),
     )
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
+# --------- Robust Hugging Face client + generation with fallback ----------
+@st.cache_resource(show_spinner=False)
+def init_hf_clients():
+    """
+    Initialize HF clients:
+      - Prefer InferenceClient (modern)
+      - Fallback to InferenceApi but pass explicit task="text2text-generation"
+    Returns dict {"client": client_obj_or_None, "kind": "inferenceclient"|"inferenceapi"|None}
+    """
+    if not HF_TOKEN:
+        return {"client": None, "kind": None}
+    # Try modern client
+    try:
+        from huggingface_hub import InferenceClient
+        client = InferenceClient(token=HF_TOKEN)
+        return {"client": client, "kind": "inferenceclient"}
+    except Exception:
+        # Fallback to legacy client with explicit task
+        try:
+            from huggingface_hub import InferenceApi
+            client = InferenceApi(repo_id=HF_MODEL, token=HF_TOKEN, task="text2text-generation")
+            return {"client": client, "kind": "inferenceapi"}
+        except Exception:
+            print("HF client init failed (both InferenceClient & InferenceApi attempted). Traceback:")
+            print(traceback.format_exc())
+            return {"client": None, "kind": None}
+
+HF_CONTEXT = init_hf_clients()
+
+def _normalize_hf_response(resp) -> str:
+    try:
+        if resp is None:
+            return ""
+        if isinstance(resp, dict):
+            if "generated_text" in resp:
+                return resp["generated_text"]
+            for v in resp.values():
+                if isinstance(v, str):
+                    return v
+                if isinstance(v, list) and v and isinstance(v[0], dict) and "generated_text" in v[0]:
+                    return v[0]["generated_text"]
+            return str(resp)
+        if isinstance(resp, list):
+            if resp and isinstance(resp[0], dict) and "generated_text" in resp[0]:
+                return resp[0]["generated_text"]
+            if resp and isinstance(resp[0], str):
+                return resp[0]
+            return " ".join(map(str, resp))
+        if isinstance(resp, str):
+            return resp
+        return str(resp)
+    except Exception:
+        print("Normalization error:", traceback.format_exc())
+        return str(resp)
+
+def _hf_generate(prompt: str, max_new_tokens: int = 80, temperature: float = 0.2, timeout: int = 30):
+    """
+    Call HF generation with retries/backoff. Raises on repeated failure.
+    """
+    if HF_CONTEXT.get("client") is None:
+        raise RuntimeError("HF_TOKEN not configured or HF client init failed.")
+    client = HF_CONTEXT["client"]
+    kind = HF_CONTEXT["kind"]
+    attempts = 3
+    backoff = 1.0
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if kind == "inferenceclient":
+                # prefer modern methods; adapt to available API
+                if hasattr(client, "text_generation"):
+                    resp = client.text_generation(model=HF_MODEL, inputs=prompt, max_new_tokens=max_new_tokens, temperature=temperature, timeout=timeout)
+                elif hasattr(client, "generate"):
+                    resp = client.generate(model=HF_MODEL, inputs=prompt, max_new_tokens=max_new_tokens, temperature=temperature)
+                else:
+                    resp = client.request(model=HF_MODEL, endpoint="text-generation", inputs=prompt, parameters={"max_new_tokens": max_new_tokens, "temperature": temperature})
+                return _normalize_hf_response(resp)
+            elif kind == "inferenceapi":
+                # legacy client
+                resp = client(inputs=prompt, parameters={"max_new_tokens": max_new_tokens, "temperature": temperature})
+                return _normalize_hf_response(resp)
+            else:
+                raise RuntimeError("No usable HF client available.")
+        except Exception as e:
+            last_exc = e
+            print(f"HF generation attempt {attempt} failed: {repr(e)}")
+            print(traceback.format_exc())
+            if attempt == attempts:
+                raise
+            time.sleep(backoff)
+            backoff *= 2.0
+    raise last_exc if last_exc is not None else RuntimeError("HF generation failed")
+
+def rewrite_bullets_with_hf(bullets: List[str], jd_text: str) -> List[str]:
+    """
+    Produce 1-5 rewritten bullets using HF (preferred), falling back to templated rewrites if HF is unavailable or fails.
+    """
+    if not bullets:
+        return []
+    # If HF client not configured, fallback quickly
+    if HF_CONTEXT.get("client") is None:
+        jd_cand = map_to_skills(tokenize_candidates(jd_text))
+        out = []
+        for i, b in enumerate(bullets[:5]):
+            extra = (jd_cand[i % len(jd_cand)] if jd_cand else "role requirements")
+            out.append(f"{b} — Aligned to {extra}; quantify impact where possible.")
+        return out
+
+    prompt_template = (
+        "You are an expert resume editor. Rewrite the following resume bullet to be concise (≤24 words), "
+        "start with a strong active verb, naturally include 1–2 relevant skill keywords from the job description, and emphasise measurable impact if possible.\n\n"
+        "JOB DESCRIPTION:\n{jd}\n\nBULLET:\n{bullet}\n\nReturn only the rewritten bullet text (no numbering)."
+    )
+
+    rewritten = []
+    for b in bullets[:5]:
+        prompt = prompt_template.format(jd=jd_text, bullet=b)
+        try:
+            out = _hf_generate(prompt, max_new_tokens=80, temperature=0.2, timeout=30)
+            out = out.replace("\n", " ").strip()
+            # Keep it reasonable length
+            if len(out.split()) > 40:
+                out = " ".join(out.split()[:40]) + "..."
+            rewritten.append(out)
+        except Exception as e:
+            print("HF rewrite failed for a bullet; falling back. Error:", repr(e))
+            print(traceback.format_exc())
+            jd_cand = map_to_skills(tokenize_candidates(jd_text))
+            extra = (jd_cand[len(rewritten) % len(jd_cand)] if jd_cand else "role requirements")
+            rewritten.append(f"{b} — Aligned to {extra}; quantify impact where possible.")
+    return rewritten
+
+# --------- Streamlit UI ----------
 st.set_page_config(page_title="AI Resume Match", page_icon="🧠", layout="wide")
 
-# Sidebar
 st.sidebar.title("AI Resume → JD Optimizer")
-st.sidebar.markdown("Upload your CV (PDF/DOCX/TXT) and paste a job description. Get a score, gaps, and AI-tailored bullet rewrites.")
+st.sidebar.markdown("Upload a CV (PDF/DOCX/TXT) and paste a job description. Get a score, gaps, and AI-tailored bullet rewrites.")
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Model settings**")
-st.sidebar.write(f"Hugging Face token present: **{bool(USE_HF)}**")
-if USE_HF:
-    st.sidebar.write(f"HF model: **{HF_MODEL}** (change by setting HF_MODEL env var)")
-st.sidebar.caption("Note: Don’t commit tokens. Use platform secrets for deployment.")
+st.sidebar.write("HF token configured:", bool(HF_TOKEN))
+st.sidebar.write("HF model:", HF_MODEL)
+st.sidebar.caption("Configure HF_TOKEN & HF_MODEL in Streamlit Secrets (TOML). Do NOT hardcode secrets in code.")
 
 st.title("AI-Powered Resume ↔ Job Description Optimizer")
-st.caption("Semantic match score, missing skills, and AI-optimized bullets — demo-ready.")
+st.caption("Semantic match score, missing skills, and AI-optimized bullets — robust and production-minded.")
 
 col1, col2 = st.columns([1, 1])
 with col1:
@@ -289,7 +319,23 @@ run = st.button("⚡ Analyze & Rewrite")
 if run:
     cv_text = ""
     if cv_file is not None:
-        cv_text = extract_text_from_upload(cv_file)
+        # read uploaded file
+        name = cv_file.name.lower()
+        data = cv_file.read()
+        try:
+            if name.endswith(".txt"):
+                cv_text = data.decode("utf-8", errors="ignore")
+            elif name.endswith(".docx"):
+                from docx import Document
+                doc = Document(io.BytesIO(data))
+                cv_text = "\n".join(p.text for p in doc.paragraphs)
+            elif name.endswith(".pdf"):
+                from pdfminer.high_level import extract_text
+                cv_text = extract_text(io.BytesIO(data))
+            else:
+                cv_text = data.decode("utf-8", errors="ignore")
+        except Exception:
+            cv_text = data.decode("utf-8", errors="ignore")
     if not cv_text:
         cv_text = cv_text_area
 
@@ -297,11 +343,11 @@ if run:
         st.error("Please provide both CV text (file or paste) and a Job Description.")
         st.stop()
 
-    # analysis
+    # Analysis
     result = analyze_match(cv_text, jd_text_area)
     semantic_score = semantic_cover_score(jd_text_area, cv_text)
 
-    # Visual score ring
+    # Score visualization
     fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
         value=result.score,
@@ -336,33 +382,21 @@ if run:
     skill_col1, skill_col2 = st.columns(2)
     with skill_col1:
         st.subheader("JD Skills")
-        if result.jd_skills:
-            st.write(", ".join(result.jd_skills))
-        else:
-            st.write("No obvious skills detected — ensure JD text is pasted.")
+        st.write(", ".join(result.jd_skills) if result.jd_skills else "No obvious skills detected — ensure JD text is pasted.")
     with skill_col2:
         st.subheader("CV Skills")
-        if result.cv_skills:
-            st.write(", ".join(result.cv_skills))
-        else:
-            st.write("No skills detected in CV text. Try pasting clearly formatted bullets.")
+        st.write(", ".join(result.cv_skills) if result.cv_skills else "No skills detected in CV text. Try pasting clearly formatted bullets.")
 
     st.markdown("### 🔧 Skill Gaps")
     gap_c1, gap_c2 = st.columns(2)
     with gap_c1:
         st.subheader("Missing Core (Required)")
-        if result.missing_core:
-            st.write(", ".join(result.missing_core))
-        else:
-            st.write("No required skills missing (based on heuristics).")
+        st.write(", ".join(result.missing_core) if result.missing_core else "No required skills missing (based on heuristics).")
     with gap_c2:
         st.subheader("Nice to Have")
-        if result.nice_to_have:
-            st.write(", ".join(result.nice_to_have))
-        else:
-            st.write("No nice-to-have skills missing.")
+        st.write(", ".join(result.nice_to_have) if result.nice_to_have else "No nice-to-have skills missing.")
 
-    # Bullets and rewrites
+    # Bullets & rewrites
     st.markdown("### ✍️ AI-Tailored Bullet Rewrites")
     bullets = extract_bullets(cv_text)
     if not bullets:
