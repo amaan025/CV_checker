@@ -5,6 +5,7 @@ plotly
 python-dotenv
 sentence-transformers>=2.2.2
 huggingface-hub>=0.15.1
+transformers>=4.34.0
 python-docx
 pdfminer.six
 scikit-learn
