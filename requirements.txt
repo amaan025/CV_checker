@@ -1,0 +1,10 @@
+streamlit>=1.25.0
+pandas
+numpy
+plotly
+python-dotenv
+sentence-transformers>=2.2.2
+huggingface-hub>=0.15.1
+python-docx
+pdfminer.six
+scikit-learn
